@@ -1,0 +1,76 @@
+---
+title: "02_DEM_Products"
+format: html
+editor: visual
+---
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "terra", "data.table", "future.apply", "sf", "sfheaders", "Rsagacmd")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+source("00_source.R")
+mission <- "West"
+```
+
+Now that we have both the cleaned and the normalized catalogs created, we have two separate directions to go: 1) Create a DEM and associated DEM derived variables, and 2) Develop canopy based metrics.
+
+```{r DEM}
+plan(multisession, workers = 8) 
+set_lidr_threads(4) 
+ctg_cln <- readLAScatalog(   
+  list.files(cln_dir, pattern = paste0(mission, ".*.las"), full.names = TRUE),  
+  chunk_buffer = 15 
+)
+dem <- rasterize_terrain(ctg_cln, res = 0.5, tin()) 
+dem <- writeRaster(dem, paste0(mission, "_DEM.tif"), overwrite = TRUE) 
+```
+
+With a DEM created, we can call upon SAGA GIS to create a handful of DEM derived variables that could be useful in tree identification.
+
+```{r SAGA}
+
+saga_path <- "C:/SAGA-GIS/saga-9.9.1_x64/saga_cmd.exe"
+saga <- saga_gis(saga_path, raster_format = "GeoTIFF", vector_format = "GeoPackage", all_outputs = FALSE)
+od <- paste0(normalizePath("terrain_layers", mustWork = FALSE), "\\", mission, "_")
+dir.create(dirname(od), showWarnings = FALSE)
+
+terr_lyrs <- saga$ta_compound$compound_basic_terrain_analysis(
+  elevation = dem,
+  slope = paste0(od, "slope.tif"),
+  aspect = paste0(od, "aspect.tif"),
+  hcurv = paste0(od, "hcurv.tif"),
+  vcurv = paste0(od, "vcurv.tif"),
+  convergence = paste0(od, "convergence.tif"),
+  flow = paste0(od, "tca.tif"),
+  wetness = paste0(od, "twi.tif"),
+  lsfactor = paste0(od, "ls_factor.tif"),
+  chnl_base = paste0(od, "chnl_base.tif"),
+  chnl_dist = paste0(od, "chnl_dist.tif"),
+  vall_depth = paste0(od, "valley_depth.tif"),
+  rsp = paste0(od, "rsp.tif"),
+  threshold = 5, 
+  .verbose = TRUE
+)
+
+demf <- saga$ta_preprocessor$sink_removal(
+  dem = dem,
+  dem_preproc = file.path(tempdir(), paste0(mission, "_dem_filled.tif")),
+  .verbose = TRUE
+)
+
+terr_cust <- saga$ta_morphometry$custom_toolchain(
+  dem = demf, t_slope = mrvbf_threshold(xres(demf)),
+  mrvbf = paste0(od, "mrvbf.tif"),
+  mrrtf = paste0(od, "mrrtf.tif"),
+  dah = paste0(od, "dah.tif"),
+  tpi = paste0(od, "tpi.tif"),
+  tri = paste0(od, "tri.tif"),
+  pos = paste0(od, "openness_pos.tif"),
+  neg = paste0(od, "openness_neg.tif"),
+  direct = paste0(od, "insolation_direct.tif"),
+  diffuse = paste0(od, "insolation_diffuse.tif"),
+  location = 1, period = 2, day = "2025-07-30", day_stop = "2025-10-08",
+  days_step = 14, .verbose = TRUE
+)
+```

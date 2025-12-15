@@ -1,0 +1,129 @@
+---
+title: "03_Canopy_Metrics"
+format: html
+editor: visual
+---
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "terra", "data.table", "future.apply", "sf", "sfheaders")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+source("00_source.R")
+mission <- "West"
+
+```
+
+Tree segmentation - I did create a lidR.li2012enhancement function (available on GitHub), however I have not implemented it here.
+
+```{r Tree segmentation}
+
+# Perform tree identification
+ctg_norm <- readLAScatalog(
+  list.files(norm_dir, pattern = paste0(mission, ".*.las"), full.names = TRUE),
+  chunk_buffer = 15, filter = "-drop_class 2 -drop_z_below 1.3 -thin_with_voxel 0.1")
+
+# Option 1: li2012 algorithm - will take some time
+plan(multisession)
+set_lidr_threads(1)
+opt_output_files(ctg_norm) <- file.path(tree_dir, "{*}_li2012")
+dir.create(tree_dir, showWarnings = FALSE)
+ctg_trees <- segment_trees(ctg_norm, algorithm = li2012(R = 0), uniqueness = "bitmerge")
+
+# Option 2: dalponte2016 - faster, but maybe less accurate
+# plan(multisession, workers = 8)
+# set_lidr_threads(4)
+# ttops <- locate_trees(
+#   ctg_norm, 
+#   lmfx(ws = function(x) {
+#     y <- 2.8 * (-(exp(-0.08*(x-5)) - 1)) + 2
+#     y[x < 5] <- 2
+#     y[x > 20] <- 4
+#     return(y)
+#   }, hmin = 5, dist_2d = 2),
+#   uniqueness = "bitmerge"
+# )
+# 
+# ttops <- Filter(nrow, ttops) %>% 
+#   do.call(rbind, .)
+# 
+# chm <- rasterize_canopy(ctg_norm, res = 0.5, algorithm = dsmtin())
+# 
+# # Segment trees
+# opt_output_files(ctg_norm) <- file.path(tree_dir, "{*}")
+# dir.create(tree_dir, showWarnings = FALSE)
+# ctg_trees <- segment_trees(ctg_norm, algorithm = dalponte2016(chm, ttops, th_tree = 5), uniqueness = "bitmerge")
+
+```
+
+Next, we want to remove dead trees from the catalog (or at least tag them as snags). This proved to be a very time consuming algorithm, though reducing the point cloud density seemed to help that out. Basically, the algorithm will provide a list of tree ID's that are deemed to be "snags". Those ID's are then associated back to the original tree segmented catalogue.
+
+```{r Snag segmentation}
+
+set_lidr_threads(8)
+plan(multisession, workers = 4)
+ctg_trees <- readLAScatalog(
+  list.files(tree_dir, pattern = paste0(mission, ".*li2012.las"), full.names = TRUE), filter = "-keep_first -thin_with_voxel 0.5", chunk_buffer = 15)
+
+# From the help example:
+bbpr_thresholds <- matrix(c(
+  0.80, 0.80, 0.70,
+  0.85, 0.85, 0.60,
+  0.80, 0.80, 0.60,
+  0.90, 0.90, 0.55
+), nrow = 3, ncol = 4)
+
+# From the paper (middle of all values)
+# bbpr_thresholds <- matrix(c(
+#   0.90, 0.90, 0.75,
+#   0.90, 0.90, 0.65,
+#   0.90, 0.85, 0.80,
+#   0.90, 0.90, 0.75
+# ), nrow = 3, ncol = 4)
+
+snag_ids <- catalog_apply(ctg_trees, snag_fun, BBPRthrsh_mat = bbpr_thresholds)
+snag_ids <- unique(do.call(c, snag_ids))
+
+# Write snag_ids to a file for easier use later on
+# write.csv(snag_ids, "snag_ids.csv")
+
+# Add a data column to the original tree data that includes whether the tree is a snag or not
+ctg_trees <- readLAScatalog(
+  list.files(tree_dir, pattern = paste0(mission, ".*li2012.las"), full.names = TRUE), chunk_buffer = 15)
+opt_output_files(ctg_trees) <- file.path(snag_dir, "{*}")
+
+ctg_snags <- catalog_map(ctg_trees, snag_id_fun, snags = snag_ids)
+
+```
+
+The segmented and snag identified catalogue is finally used to calculate a suite of customized metrics for each tree.
+
+```{r Canopy metrics}
+# Extract crown metrics (data)
+
+plan(multisession, workers = 8)
+set_lidr_threads(4)
+ctg_trees <- readLAScatalog(
+  list.files(snag_dir, pattern = paste0(mission, ".*_li2012.las"), full.names = TRUE), 
+  chunk_buffer = 15
+)
+tree_metrics <- crown_metrics(
+  ctg_trees,
+  ~my_metrics(
+    X, Y, Z, Intensity, ReturnNumber, Classification, R = R, G = G, B = B),
+  geom = "concave", concaveman = c(2, 0))
+
+if(inherits(tree_metrics, "list")) {
+  tree_metrics <- Filter(nrow, tree_metrics) %>%
+    do.call(rbind, .)
+}
+
+# Filter trees that fall within 5-95% of the number of points per tree
+# distribution (i.e.: an attempt to make sure that these are real, singular trees)
+tree_dist <- quantile(tree_metrics$npoints, probs = c(0.05, 0.95))
+tree_metrics <- tree_metrics %>% 
+  filter(between(npoints, tree_dist[1], tree_dist[2])) %>% 
+  select(-c(pzabove2, itot, ipground, npoints))
+
+write_sf(tree_metrics, paste0(mission, "_tree_metrics.gpkg"))
+```

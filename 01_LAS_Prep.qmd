@@ -1,0 +1,97 @@
+---
+title: "01_LAS_Prep"
+author: "Matthew Coghill"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+Use this for the preparation of the LAS files before further processing. This includes clipping, tiling, noise cleaning, and height normalization. First, load the required packages.
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "terra", "data.table", "future.apply", "sf", "sfheaders")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+source("00_source.R")
+```
+
+2 custom functions have been created below, and one other function is loaded in from a separate R script. The first custom function is used to create the tile shapes that intersect with the shape of the study area so that data outside of that area isn't processed for speeding things up. The second custom function performs noise classification and cleaning, and height normalization. This will be used after the tiling. Further details are given below for defending my choice of each algorithm. The function that is loaded from the R script will hopefully allow for choosing the optimum core parameters for multicore use on any machine.
+
+The `lidR` package as of January 10, 2023 only has 2 noise classification algorithms. There is either the `sor()` or `ivf()` algorithm. `sor()` is based on statistical outliers removal methods that were used in other software, and `ivf()` is based on an isolated voxels filter and is similar to methods used for noise classification in a popular LiDAR analysis tool LAStools. The LAStools noise classification standard can be found here in the associated README file: <https://rapidlasso.com/lastools/lasnoise/>
+
+"The default for 'step' is 4 and for 'isolated' is 5"
+
+"step" is analogous to the parameter "res" and "isolated" is analogous to "n". See the examples in the README to understand better.
+
+Finally, height normalization uses the `tin()` algorithm, the "triangular irregular network" or spatial interpolation based on a Delaunay triangulation. This is a popular algorithm to use for height normalization compared to `kriging()` and `knnidw()`, as well as being relatively effortless to use when it comes to its parameters.
+
+The first thing that gets done is separating the single large LAS file into smaller 150m x 150m chunks. This limits the amount of data loaded during computations on your PC. It sometimes allows for faster computations as well depending on the algorithms used.
+
+For both 2021 and 2022, the KM1210 block was flown using 2 separate flights for the northern and the southern regions. This creates an overlap with too much data, so there is a need to separate out those regions and only use one of the flights over one spatial area. All other flights were much more simple.
+
+```{r Process into chunks}
+
+# Tile size
+ts <- 100
+
+ctg <- readLAScatalog(las_fname, chunk_buffer = 0, chunk_size = ts)
+opt_chunk_alignment(ctg) <- c(ts, ts)
+aoi_in <- list.files(shape_dir, pattern = ".kml", full.names = TRUE)
+aoi <- read_sf(aoi_in[grep(mission, aoi_in)]) %>% 
+  st_zm() %>% 
+  st_transform(st_crs(ctg))
+ctg_shps <- catalog_shapes(ctg, aoi, mission)
+opt_output_files(ctg) <- file.path(tile_dir, "{id}_{xmin}_{ymin}")
+
+# Set up parallel environment
+plan(multisession)
+block_clip <- clip_roi(ctg, ctg_shps)
+
+plan(sequential)
+gc()
+
+```
+
+Let's think about what needs to get done. Snags need to be segmented from the point cloud, as well as trees. In order to do this, the point cloud needs to be normalized. Snag segmentation requires a normalized point cloud, and it also requires intensity in range of 0-255. Our data is multiplied by 256, so simply divide our data by 256 to get the appropriate intensity values. The question then becomes: does the intensity need to be normalized? To see, we can create a raster map of the intensity values to see if we can see obvious swath paths. if so, we should normalize the intensity values first. If not, we can proceed with what we have.
+
+```{r Clean and normalize}
+
+set_lidr_threads(2)
+plan(multisession, workers = availableCores() / 2)
+
+# Read in the LAS catalog and set some parameters for its output
+tiles <- list.files(tile_dir, pattern = paste0(mission, ".*.\\.las$"), full.names = TRUE)
+ctg_tiles <- readLAScatalog(tiles, chunk_buffer = 15)
+opt_output_files(ctg_tiles) <- file.path(cln_dir, "{*}")
+
+# Run the ctg_clean function created above in parallel and create .lax files
+# for faster indexing in future functions.
+ctg_cln <- catalog_map(ctg_tiles, ctg_clean)
+lidR:::catalog_laxindex(ctg_cln)
+
+# Now normalize that catlog
+ctg_cln <- readLAScatalog(
+  list.files(cln_dir, pattern = paste0(mission, ".*.las"), full.names = TRUE),
+  chunk_buffer = 15
+)
+opt_output_files(ctg_cln) <- file.path(norm_dir, "{*}")
+ctg_norm <- normalize_height(ctg_cln, tin())
+lidR:::catalog_laxindex(ctg_norm)
+
+plan(sequential)
+gc()
+
+# Let's check the intensity map to see if we need to normalize intensity:
+ctg_norm <- readLAScatalog(
+  list.files(norm_dir, pattern = paste0(mission, ".*.las"), full.names = TRUE),
+  filter = "-keep_first", select = "xyzi", chunk_buffer = 15
+)
+opt_output_files(ctg_norm) <- ""
+m <- ~list(avgI = mean(Intensity))
+int_rast <- pixel_metrics(ctg_norm, m, res = 5)
+plot(int_rast)
+
+# Looks fine overall - no intensity normalization currently required!
+```

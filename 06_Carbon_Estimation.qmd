@@ -1,0 +1,65 @@
+---
+title: "06_Carbon_Estimation"
+format: html
+editor: visual
+---
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "terra", "data.table", "future.apply", "sf", "sfheaders", "FAIBBase", "units")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+source("00_source.R")
+mission <- "West"
+
+```
+
+The whole point of this excercise is to get total carbon.
+
+```{r}
+
+#### Biomass/Carbon estimation ####
+tree_df_train_pred <- read_sf(paste0(mission, "_Modelled_Tree_Species.gpkg"))
+
+# Use FAIBBase to get aboveground biomass, then calculate belowground biomass
+# using a formula from WWF and finally estimate the carbon stock for each tree.
+c_tree <- tree_df_train_pred %>% 
+  mutate(
+    species2 = case_when(
+      species == "alder" ~ "red alder",
+      species == "aspen" ~ "trembling aspen",
+      species == "birch" ~ "white birch",
+      species == "cedar" ~ "western redcedar",
+      species == "cottonwood" ~ "black cottonwood",
+      species == "fir" ~ "subalpine fir",
+      species == "hemlock" ~ "western hemlock",
+      species == "pine" ~ "lodgepole pine",
+      species == "spruce" ~ "white spruce",
+      .default = species
+    )) %>% 
+  mutate(
+    agb = biomassCalculator(species = species2, DBH = dbh * 100, height = zmax),
+    bgb = ifelse(
+      species %in% c("alder", "aspen", "birch", "cottonwood"),
+      0.1576 * (agb ^ 0.615),
+      0.222 * agb),
+    carbon_stock = as_units((agb + bgb) * 0.5, "kg"))
+
+# Summarize the data
+c_tree_tot <- c_tree %>% 
+  st_drop_geometry() %>% 
+  group_by(species2) %>% 
+  summarise(total_c_kg = sum(carbon_stock, na.rm = TRUE), n = n()) %>% 
+  mutate(c_stock_kg_ha = total_c_kg / set_units(st_area(aoi), "ha")) %>% 
+  rename(species = species2)
+
+# Get a table showing the individual tree ID's, species, heights, and DBH's
+c_tree_min <- st_drop_geometry(c_tree) %>% 
+  select(c(treeID, zmax, species2, dbh))
+
+# Write data
+write.csv(c_tree_tot, paste0(mission, "_carbon_stock.csv"), row.names = FALSE)
+write.csv(c_tree_min, paste0(mission, "_tree_data.csv"), row.names = FALSE)
+print(c_tree_tot)
+
+```

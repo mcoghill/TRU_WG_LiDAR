@@ -1,0 +1,178 @@
+---
+title: "05_Species_Modelling"
+format: revealjs
+editor: visual
+---
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "terra", "data.table", "future.apply", "sf", "sfheaders")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+source("00_source.R")
+mission <- "West"
+
+```
+
+We need to build a model that includes using DBH. This variable needs to be incorporated even for new data; however, we need to get this modelled and predicted for the new data. I won't use a complex machine learning algorithm for this; rather, I will focus on height based metrics only.
+
+```{r}
+
+# Read in the training data
+tree_train <- read.csv(paste0(mission, "_tree_training_df.csv")) %>%
+  filter(species != "alder") %>% 
+  mutate(species = factor(species))
+tree_metrics_r <- read_sf(paste0(mission, "_tree_metrics.gpkg"))
+
+# Create the training dataset for modelling DBH. Must remove species column
+# because that is not included in the testing dataset. Also remove terrain 
+# variables and intensity based variables (not useful in determining DBH)
+dbh_train <- tree_train %>% 
+  select(-c(species, starts_with(paste0(mission, "_")), starts_with("i")))
+
+# Create a simple ranger model to predict DBH from height based variables
+set.seed(123)
+rf_dbh <- ranger(dbh ~ ., data = dbh_train, importance = "impurity")
+dbh_vars <- names(dbh_train)[names(dbh_train) != "dbh"]
+
+# Add DBH into the tree metrics by modelling what it should be.
+tree_metrics_r_dbh <- tree_metrics_r %>% 
+  mutate(dbh = predict(rf_dbh, tree_metrics_r %>% 
+                         st_drop_geometry() %>% 
+                         select(all_of(dbh_vars)))$prediction)
+
+```
+
+Now, build a simple model to predict species using all available data
+
+```{r}
+
+set.seed(123)
+rf <- ranger(species ~ ., data = tree_train, importance = "impurity")
+rf
+```
+
+The initial model isn't great, but perhaps with some other variables or reducing some of the other input variables we can improve this.
+
+```{r}
+library(mlr3verse)
+# library(mlr3spatiotempcv)
+# tree_train_pt <- st_centroid(tree_train_sf)
+tree_train <- read.csv(paste0(mission, "_tree_training_df.csv")) %>% 
+  filter(species != "alder")
+tsk_species <- as_task_classif(tree_train, target = "species")
+
+# Create the learner for feature filtering
+lrn_filter <- lrn("classif.ranger", importance = "impurity")
+
+# Train a ranger learner which will have stored feature importances. This order
+# of features is what will be used downstream for feature filtering.
+plan(multisession)
+rr_filter <- resample(tsk_species, lrn_filter, rsmp("loo"), store_models = TRUE)
+plan(sequential)
+
+# spoof (aggregate) the importance values
+rr_learners <- rr_filter$learners
+rr_imps <- as.data.frame(
+  sapply(rr_learners, function(x) x$importance())
+)
+rr_imps_vals <- sort(rowSums(rr_imps), decreasing = TRUE)
+rr_filter_results <- as.data.table(rr_filter$score(msr("oob_error")))
+best_filter_id <- which.min(rr_filter_results$oob_error)
+filter_learner <- rr_filter$learners[[best_filter_id]]$base_learner()
+filter_learner$model$variable.importance <- rr_imps_vals
+
+# Place the best resulting learner into a filtering pipeop
+po_filter <- po("filter",
+  filter = flt("importance", learner = filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_species$feature_names))
+)
+
+# Next, create a learner pipeop that will tune the hyperparameters
+lrn_tune <- lrn("classif.ranger",
+  importance = "impurity",
+  # predict_type = "prob",
+  num.trees = to_tune(100, 2000),
+  mtry = to_tune(1, length(tsk_species$feature_names))
+)
+po_lrn <- po("learner", lrn_tune)
+
+# Create the graph learner object that will combine these
+graph <- as_learner(po_filter %>>% po_lrn)
+
+# Create the tuning design grid to tune across possible nfeat and mtry values
+design <- expand.grid(
+  importance.filter.nfeat = length(tsk_species$feature_names):4,
+  classif.ranger.num.trees = c(500, 1000, 2000),
+  classif.ranger.mtry = c(
+    length(tsk_species$feature_names), 
+    seq(signif(length(tsk_species$feature_names), 1), 10, -5),
+    9:1)
+) %>%
+  dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
+tn <- tnr("design_points", design = as.data.table(design))
+
+# Create the auto-tuner object
+at <- auto_tuner(
+  tuner = tn,
+  learner = graph,
+  resampling = rsmp("cv", folds = 4),
+  measure = msr("classif.bacc"),
+  terminator = trm("none")
+)
+
+# Runs both outer and inner loops in parallel
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  tweak(multisession, workers = I(4))
+))
+rr <- mlr3::resample(
+  tsk_species, at, rsmp("cv", folds = 8),
+  store_models = TRUE
+)
+plan(sequential)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+data <- as.data.table(rr)
+outer_learners <- lapply(data$learner, "[[", "learner")
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+outer_results <- as.data.table(rr$score(msr("classif.bacc")))
+
+# Now, from the outer learners, extract the one with the lowest binary Brier
+# score. Note that if the data is imbalanced, we should probably evaluate
+# models using the area under the precision recall ROC curve (classif.prauc)
+# according to the documentation
+best_id <- which.max(outer_results$classif.bacc)
+best_learner <- outer_learners[[best_id]]$base_learner()
+
+# Get aggregated results:
+best_agg_score <- rr$aggregate(msr("classif.bacc"))
+ml_prediction <- as.data.table(rr$prediction())
+ml_confusion <- rr$prediction()$confusion
+
+# Run prediction of model on unused data
+tree_df_pred <- tree_metrics_r_dbh %>% 
+  filter(!treeID %in% tree_all$treeID) %>% 
+  mutate(species = best_learner$predict_newdata(.)$response) %>% 
+  rename(geometry = geom)
+
+g_name <- attributes(tree_df_pred)$sf_column
+tree_df_train_pred <- rbind(
+  tree_all %>% 
+    select(any_of(c(names(tree_df_pred), g_name))) %>% 
+    rename(!!g_name := attributes(tree_all)$sf_column) %>% 
+    filter(species != "alder"),
+  tree_df_pred
+)
+
+write_sf(tree_df_train_pred, paste0(mission, "_Modelled_Tree_Species.gpkg"))
+write.ftable(
+  ftable(ml_confusion), paste0(mission, "_confusion_matrix.csv"), 
+  quote = FALSE, sep = ",")
+
+mapview::mapview(tree_df_pred, zcol = "species")
+```

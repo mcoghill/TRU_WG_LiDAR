@@ -1,0 +1,174 @@
+---
+title: "04_Training_Data"
+format: html
+editor: visual
+---
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "terra", "data.table", "future.apply", "sf", "sfheaders", "Rsagacmd", "readxl", "ranger")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+source("00_source.R")
+mission <- "West"
+
+```
+
+Next, we need to load in the data that Cristhina generated and generate a model that can predict the species of tree we have based on the existing attributes.
+
+```{r}
+
+tree_metrics <- read_sf(paste0(mission, "_tree_metrics.gpkg"))
+
+# Add to this dataset - extract raster data
+r <- rast(list.files("terrain_layers", pattern = mission, full.names = TRUE))
+tree_metrics_r <- terra::extract(
+  r, vect(tree_metrics), fun = mean, na.rm = TRUE, ID = FALSE, bind = TRUE) %>% 
+  st_as_sf() %>% 
+  filter(!treeID %in% snag_ids) %>% 
+  st_set_agr("constant")
+
+# Alright, some less reliable data wrangling here but should still work alright
+field_df <- read_excel("00_Shapes/Tree inventory fieldwork.xlsx") %>% 
+  janitor::clean_names() %>% 
+  rename(
+    notes = x11, dbh = dbh_cm, zmax = total_height_m, 
+    crown_width_x = crown_width_e_w, crown_width_y = crown_width_n_s) %>% 
+  # distinct(species, dbh, zmax, top_height_m, base_height_m,
+  #          crown_width_x, crown_width_y, .keep_all = TRUE) %>% 
+  mutate(
+    crown_width_x = gsub("\\.\\.", ".", crown_width_x),
+    crown_width_x = gsub("\\.$", "", crown_width_x),
+    crown_width_x = as.numeric(crown_width_x),
+    dbh = dbh / 100,
+    species = tolower(species), 
+    species = gsub("redcedar", "cedar", species),
+    species = word(species, -1),
+    id = as.numeric(paste0(plot, ".", formatC(id, width = 3, format = "d", flag = "0")))) %>% 
+  filter(
+    !notes %in% "Dead tree", crown_width_x > 0, crown_width_y > 0, 
+    zmax < 1000, zmax >= 2, dbh < 10) %>% 
+  select(-c(notes, survey_date, top_height_m, base_height_m)) 
+
+# Filter by plot based on plot id. Plot 1-20 is data from the West side, plot 21 
+# is data from the East side, and plot 22 has data that is included in the 2025 
+# data collection from above already so don't need it here (removes some 
+# redundancy)
+if(mission == "West") {
+  field_df_out <- field_df %>% 
+    filter(plot < 21)
+} else {
+  field_df_out <- field_df %>% 
+    filter(plot == 21)
+}
+
+# Read in data from DJI Terra identification
+df1 <- read_xlsx(file.path(shape_dir, paste0("WG_", mission, "_trees.xlsx"))) %>% 
+  janitor::clean_names() %>% 
+  st_as_sf(coords = c("x_e", "y_n", "z_u"), crs = st_crs(tree_metrics)) %>% 
+  st_zm() %>% 
+  rename(species = name) %>% 
+  filter(!species %in% c("Coordinate")) %>% 
+  mutate(species = tolower(species),
+         species = gsub("[0-9]+", "", species),
+         species = gsub("cottonwod", "cottonwood", species))
+
+# Read in additional point data collected from field in 2025
+df2 <- read_xlsx(file.path(shape_dir, "Field data Spring 2025.xlsx"),
+                 sheet = "Sheet1", skip = 1) %>%
+  janitor::clean_names() %>%
+  rename(species = x6, id = name) %>%
+  st_as_sf(coords = c("x", "y", "ele"), crs = 4326) %>%
+  st_zm() %>%
+  st_transform(st_crs(tree_metrics)) %>%
+  # select(species) %>%
+  mutate(plot = ifelse(time > ymd("2025-01-16"), 21, 22),
+         species = tolower(species),
+         species = word(species, -1),
+         id = 1:nrow(.),
+         id = as.numeric(paste0(plot, ".", formatC(id, width = 3, format = "d", flag = "0")))) %>% 
+  distinct() %>% 
+  left_join(field_df, by = c("species", "id"))
+
+# Bind both data sources together
+df <- rbind(df1, df2 %>% select(species)) %>% 
+  st_buffer(0.5) %>% 
+  st_set_agr("constant")
+
+# Some outliers, deal with them
+field_df_out <- field_df_out %>% 
+  group_by(species, plot) %>% 
+  mutate(
+    dbh_out = rstatix::is_outlier(dbh),
+    zmax_out = rstatix::is_outlier(zmax)) %>% 
+  filter(!dbh_out & !zmax_out) %>% 
+  ungroup() %>% 
+  select(-c(dbh_out, zmax_out))
+
+# Join the polygons of trees to the data points, giving the heights and crown
+# shapes for each tree
+tree_int <- st_join(tree_metrics_r, df, join = st_is_within_distance, dist = 2) %>% 
+  filter(!is.na(species)) %>% 
+  distinct(treeID, .keep_all = TRUE)
+
+
+# Now, use this field collected data to model the DBH's of the data gathered
+# from DJI Terra and the field
+dbh_m <- lm(dbh ~ zmax * species, data = field_df_out)
+tree_int <- tree_int %>% 
+  mutate(dbh = predict(dbh_m, data.frame(zmax = zmax, species = species)))
+
+# Read in the GPS coordinates for the plots
+plot_area <- read_excel(
+  "00_Shapes/GPS coordinates Fall 2024.xlsx", 
+  col_names = c("plot", "coordinates")
+) %>% 
+  separate(coordinates, into = c("Long", "Lat"), sep = ", ") %>% 
+  mutate(across(c("Long", "Lat"), as.numeric),
+         plot = as.numeric(gsub("PLOT ", "", plot))) %>% 
+  st_as_sf(coords = c("Lat", "Long"), crs = 4326) %>% 
+  st_transform(st_crs(tree_metrics)) %>% 
+  st_buffer(25)
+
+if(mission == "West") {
+  # Can we match this field data to any of the trees identified in lidR?
+  potential_trees <- st_join(tree_metrics_r, plot_area) %>% 
+    filter(!treeID %in% tree_int$treeID, !is.na(plot))
+  df_mod <- lapply(1:nrow(field_df_out), function(x) {
+    field_pt <- field_df_out[x, ]
+    tree_match <- potential_trees %>% 
+      filter(plot == field_pt$plot)
+    if(nrow(tree_match) > 0) {
+      tree_match <- tree_match %>% 
+        rowwise() %>% 
+        mutate(zmax_d = abs(zmax - field_pt$zmax),
+               crown_width_x_d = abs(crown_width_x - field_pt$crown_width_x),
+               crown_width_y_d = abs(crown_width_y - field_pt$crown_width_y),
+               d_tot = sum(zmax_d, crown_width_x_d, crown_width_y_d)) %>% 
+        ungroup() %>% 
+        dplyr::slice_min(d_tot, n = 1) %>% 
+        select(-c(zmax_d, crown_width_x_d, crown_width_y_d)) %>% 
+        mutate(species = field_pt$species, dbh = field_pt$dbh)
+    } else return(NULL)
+  }) %>% 
+    do.call(rbind, .) %>% 
+    group_by(treeID) %>% 
+    slice_min(d_tot, n = 1) %>% 
+    ungroup() %>% 
+    filter(d_tot < 5) %>% 
+    select(-c(d_tot, plot))
+  
+  # Combine all lidR identified trees with the field identified trees that we 
+  # roughly determined which was which for based on the data.
+  tree_all <- rbind(tree_int, df_mod)
+} else tree_all <- tree_int
+
+tree_train_sf <- tree_all %>% 
+  select(-c(treeID)) %>% 
+  mutate(species = factor(species))
+tree_train <- st_drop_geometry(tree_train_sf)
+
+write_sf(tree_metrics_r, paste0(mission, "_tree_metrics.gpkg"))
+write.csv(tree_train, paste0(mission, "_tree_training_df.csv"), row.names = FALSE)
+
+```
